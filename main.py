@@ -108,6 +108,24 @@ async def send_target_warning_once():
     except Exception as e:
         logger.warning("対象ユーザーへの警告DM送信に失敗: %s", e)
 
+async def delete_old_warning_dm():
+    # 対象ユーザーへ送信した旧警告DMの削除処理
+    try:
+        user = bot.get_user(config.TARGET_USER_WARN_ID) or await bot.fetch_user(config.TARGET_USER_WARN_ID)
+        if not user:
+            return
+        dm = user.dm_channel or await user.create_dm()
+        async for msg in dm.history(limit=30):
+            if msg.author.id == bot.user.id:
+                if any(keyword in msg.content for keyword in ["反革命", "写真から消去", "最高指導部", "🚨"]):
+                    try:
+                        await msg.delete()
+                        logger.info("旧警告DMを削除: %s", msg.id)
+                    except Exception as e:
+                        logger.warning("旧警告DMの削除失敗: %s", e)
+    except Exception as e:
+        logger.warning("旧DM履歴の取得失敗: %s", e)
+
 @bot.event
 async def on_guild_join(guild: discord.Guild):
     await enforce_guild_restriction(guild)
@@ -117,6 +135,7 @@ async def on_ready():
     logger.info("システム稼働。共産趣味ボット統制下オンライン。(%s)", bot.user)
     for guild in list(bot.guilds):
         await enforce_guild_restriction(guild)
+    bot.loop.create_task(delete_old_warning_dm())
     bot.loop.create_task(send_target_warning_once())
 
 if __name__ == "__main__":
