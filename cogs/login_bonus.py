@@ -2,19 +2,23 @@ import asyncio
 import datetime
 import logging
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import database
-from config import JST
+from config import JST, ALLOWED_GUILD_ID
 
 logger = logging.getLogger(__name__)
 
 class LoginBonusCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.monthly_points_reset.start()
+
+    def cog_unload(self):
+        self.monthly_points_reset.cancel()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
+        if message.author.bot or not message.guild or message.guild.id != ALLOWED_GUILD_ID:
             return
 
         now_jst = datetime.datetime.now(JST)
@@ -51,6 +55,20 @@ class LoginBonusCog(commands.Cog):
                 await target_channel.send(reply_text, delete_after=5.0)
             except discord.HTTPException as e:
                 logger.warning("ログイン通知の送信に失敗しました: %s", e)
+
+    @tasks.loop(time=datetime.time(hour=0, minute=0, second=5, tzinfo=JST))
+    async def monthly_points_reset(self):
+        now_jst = datetime.datetime.now(JST)
+        if now_jst.day != 1:
+            return
+        prev_month = (now_jst.replace(day=1) - datetime.timedelta(days=1)).strftime("%Y-%m")
+        curr_month = now_jst.strftime("%Y-%m")
+        await asyncio.to_thread(database.reset_monthly_points_for_all, curr_month, prev_month)
+        logger.info("月初一括ポイントリセット完了: %s -> %s", prev_month, curr_month)
+
+    @monthly_points_reset.before_loop
+    async def before_monthly_points_reset(self):
+        await self.bot.wait_until_ready()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(LoginBonusCog(bot))

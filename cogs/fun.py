@@ -8,6 +8,7 @@ class FunCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="omikuji", description="今日の君の運勢（党からの評価）を占う")
+    @app_commands.guild_only()
     async def omikuji(self, interaction: discord.Interaction):
         results = [
             ("🌟 大吉 (書記長)", "同志よ、君の指導力は最高潮だ。五カ年計画は1年で達成されるだろう！", 0xffd700),

@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import database
-from config import JST, AKEOME_STAMP_ID, NUMBER_EMOJIS
+from config import JST, AKEOME_STAMP_ID, NUMBER_EMOJIS, ALLOWED_GUILD_ID
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,16 @@ class AkeomeCog(commands.Cog):
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.member and payload.member.bot:
             return
+
+        if payload.guild_id and payload.guild_id != ALLOWED_GUILD_ID:
+            return
             
         emoji_id = payload.emoji.id
         if emoji_id != AKEOME_STAMP_ID:
             return
 
         race_channel_id = await asyncio.to_thread(database.get_race_channel_id)
-        if race_channel_id != 0 and payload.channel_id != race_channel_id:
+        if race_channel_id and payload.channel_id != race_channel_id:
             return
 
         now_jst = datetime.datetime.now(JST)
@@ -44,9 +47,10 @@ class AkeomeCog(commands.Cog):
             )
             return
 
-        if now_jst.hour == 0 and now_jst.minute <= 1:
+        sec_diff = (now_jst - today_00).total_seconds()
+        if now_jst.hour == 0 and 0.0 <= sec_diff <= 60.0:
             date_str = today_00.strftime("%Y-%m-%d")
-            ms = (now_jst - today_00).total_seconds() * 1000
+            ms = sec_diff * 1000
             await asyncio.to_thread(database.save_akeome_record, payload.user_id, date_str, ms, 0)
             
             channel = self.bot.get_channel(payload.channel_id)
@@ -60,7 +64,7 @@ class AkeomeCog(commands.Cog):
 
     async def announce_akeome_rank(self, message: discord.Message, user: discord.User, date_str: str):
         rank = await asyncio.to_thread(database.get_akeome_today_rank, user.id, date_str)
-        if rank is None:
+        if not rank or rank <= 0:
             return
 
         if 1 <= rank <= 9:
@@ -75,6 +79,7 @@ class AkeomeCog(commands.Cog):
                 logger.warning("ランクメッセージの送信に失敗しました: %s", e)
 
     @app_commands.command(name="akeome_ranking", description="今月のあけおめ最速ランキングを表示します")
+    @app_commands.guild_only()
     async def akeome_ranking(self, interaction: discord.Interaction):
         await interaction.response.defer()
         now = datetime.datetime.now(JST)
@@ -86,14 +91,17 @@ class AkeomeCog(commands.Cog):
         embed = discord.Embed(title=f"月間最速ランキング ({now.strftime('%Y-%m')})", color=discord.Color.dark_red())
         desc_lines = []
         for idx, (uid, best_ms) in enumerate(rankings, 1):
-            u = self.bot.get_user(uid)
-            u_name = u.display_name if u else f"同志({uid})"
+            try:
+                u = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                u_name = u.display_name if u else f"同志({uid})"
+            except Exception:
+                u_name = f"同志({uid})"
             desc_lines.append(f"[{idx}位] {u_name} : +{best_ms:.3f} ms\n")
 
         embed.description = "".join(desc_lines)
         await interaction.followup.send(embed=embed)
 
-    @tasks.loop(time=datetime.time(hour=0, minute=0, second=30, tzinfo=JST))
+    @tasks.loop(time=datetime.time(hour=0, minute=1, second=10, tzinfo=JST))
     async def announce_daily_akeome(self):
         race_channel_id = await asyncio.to_thread(database.get_race_channel_id)
         if not race_channel_id:

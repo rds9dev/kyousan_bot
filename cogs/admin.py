@@ -12,6 +12,8 @@ from config import JST, ALLOWED_ROLES, RANKING_CHANNEL_ID
 logger = logging.getLogger(__name__)
 
 def is_authorized_for_censor(interaction: discord.Interaction) -> bool:
+    if not isinstance(interaction.user, discord.Member):
+        return False
     if interaction.user.guild_permissions.administrator:
         return True
     user_role_ids = [role.id for role in interaction.user.roles]
@@ -25,10 +27,16 @@ class AdminCog(commands.Cog):
     def cog_unload(self):
         self.automated_thread_sync.cancel()
 
-    async def perform_thread_sync(self, target_channel: typing.Union[discord.TextChannel, discord.ForumChannel], notify_channel: discord.TextChannel = None):
+    async def perform_thread_sync(self, target_channel: typing.Union[discord.TextChannel, discord.ForumChannel], notify_channel: discord.TextChannel = None) -> dict:
         thread_counts = {}
 
         threads_dict = {t.id: t for t in target_channel.threads}
+        try:
+            for t in await target_channel.active_threads():
+                threads_dict[t.id] = t
+        except Exception as e:
+            logger.debug("active_threads取得スキップ: %s", e)
+
         async for thread in target_channel.archived_threads(limit=None):
             threads_dict[thread.id] = thread
         threads = list(threads_dict.values())
@@ -37,7 +45,7 @@ class AdminCog(commands.Cog):
         status_msg = None
         if notify_channel:
             try:
-                status_msg = await notify_channel.send(f"📊 **走査開始... (重複排除済: 全 {total} スレッドを処理予定)**")
+                status_msg = await notify_channel.send(f"📊 **走査開始: {target_channel.name} (全 {total} スレッド)**")
             except discord.HTTPException as e:
                 logger.warning("ステータスメッセージの送信失敗: %s", e)
 
@@ -45,7 +53,7 @@ class AdminCog(commands.Cog):
             if status_msg and i > 0 and i % 10 == 0:
                 pct = int((i / total) * 100) if total else 100
                 try:
-                    await status_msg.edit(content=f"🔄 走査中... ({i}/{total} スレッド完了) ({pct}%)")
+                    await status_msg.edit(content=f"🔄 走査中: {target_channel.name} ({i}/{total} スレッド完了) ({pct}%)")
                 except discord.HTTPException as e:
                     logger.warning("ステータス更新失敗: %s", e)
             try:
@@ -58,14 +66,13 @@ class AdminCog(commands.Cog):
                 logger.warning("スレッド %s の履歴取得失敗: %s", thread.id, e)
             await asyncio.sleep(0.1)
 
-        await asyncio.to_thread(database.bulk_save_thread_activity, thread_counts)
-
         if status_msg:
             try:
-                await status_msg.edit(content=f"✅ **計画経済達成。DBを浄化し、全 {total} スレッドの正確な再構築が完了した。**")
+                await status_msg.edit(content=f"✅ **走査完了: {target_channel.name} (全 {total} スレッド走査済)**")
             except discord.HTTPException as e:
                 logger.warning("完了メッセージの送信失敗: %s", e)
         gc.collect()
+        return thread_counts
 
     async def run_all_scans(self, notify_channel: discord.TextChannel = None):
         targets = await asyncio.to_thread(database.get_scan_targets)
@@ -76,14 +83,25 @@ class AdminCog(commands.Cog):
                 except discord.HTTPException:
                     pass
             return
+
+        all_threads = {}
         for channel_id, notify in targets:
             channel = self.bot.get_channel(channel_id)
             if not channel:
                 continue
-            target_notify = notify_channel if (notify and notify_channel) else None
-            await self.perform_thread_sync(channel, target_notify)
+            target_notify = notify_channel if (notify or notify_channel) else None
+            counts = await self.perform_thread_sync(channel, target_notify)
+            all_threads.update(counts)
+
+        await asyncio.to_thread(database.bulk_save_thread_activity, all_threads)
+        if notify_channel:
+            try:
+                await notify_channel.send(f"🎖️ **国家計画経済達成: 全走査対象 ({len(targets)}チャンネル, 計{len(all_threads)}スレッド) の再構築完了。**")
+            except discord.HTTPException:
+                pass
 
     @app_commands.command(name="censor", description="【管理者/権限ロール専用】指定ユーザーのメッセージを粛清する")
+    @app_commands.guild_only()
     async def censor(self, interaction: discord.Interaction, target: discord.Member, limit: int = 50):
         if not is_authorized_for_censor(interaction):
             return await interaction.response.send_message("❌ 権限がありません。KGBに通報しました。", ephemeral=True)
@@ -92,10 +110,11 @@ class AdminCog(commands.Cog):
         await interaction.followup.send(f"粛清完了: {target.display_name} の痕跡を {len(deleted)} 件消し去った。")
 
     @app_commands.command(name="setting", description="【管理者/権限ロール専用】走査設定を管理します")
+    @app_commands.guild_only()
     @app_commands.describe(
         action="操作の種類",
         channel="add_target/remove_target/set_race_channel で指定するチャンネル",
-        notify="toggle_notify で通知を有効にするか"
+        notify="toggle_notify で通知を有効にするか（省略時は反転）"
     )
     @app_commands.choices(action=[
         app_commands.Choice(name="add_target", value="add_target"),
@@ -109,7 +128,7 @@ class AdminCog(commands.Cog):
         interaction: discord.Interaction,
         action: app_commands.Choice[str],
         channel: typing.Union[discord.TextChannel, discord.ForumChannel] = None,
-        notify: bool = True
+        notify: typing.Optional[bool] = None
     ):
         if not is_authorized_for_censor(interaction):
             return await interaction.response.send_message("❌ 権限がありません。KGBに通報しました。", ephemeral=True)
@@ -131,7 +150,8 @@ class AdminCog(commands.Cog):
         elif act == "toggle_notify":
             if not channel:
                 return await interaction.followup.send("❌ チャンネルを指定してください。")
-            res = await asyncio.to_thread(database.toggle_scan_target_notify, channel.id)
+            explicit_val = 1 if notify is True else (0 if notify is False else None)
+            res = await asyncio.to_thread(database.toggle_scan_target_notify, channel.id, explicit_val)
             if res is None:
                 return await interaction.followup.send("❌ そのチャンネルは走査対象に登録されていません。")
             state = "有効" if res else "無効"
@@ -160,6 +180,7 @@ class AdminCog(commands.Cog):
             await interaction.followup.send(f"🎯 あけおめ受付チャンネルを {channel.mention} に設定しました。")
 
     @app_commands.command(name="soviet_sync", description="【管理者専用】指定スレッドの全ログを手動で回収し、DBを浄化する")
+    @app_commands.guild_only()
     async def soviet_sync(self, interaction: discord.Interaction):
         if not interaction.user.guild_permissions.administrator:
             return await interaction.response.send_message("❌ 管理者権限がありません。シベリアへ送ります。", ephemeral=True)

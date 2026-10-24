@@ -7,7 +7,7 @@ from config import DB_PATH, DEFAULT_RACE_CHANNEL_ID
 logger = logging.getLogger(__name__)
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -96,11 +96,19 @@ def get_akeome_today_rank(user_id: int, date_str: str):
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "SELECT COUNT(*) FROM akeome_records WHERE date_str = ? AND is_flying = 0 AND response_ms <= (SELECT response_ms FROM akeome_records WHERE user_id = ? AND date_str = ? AND is_flying = 0)",
-            (date_str, user_id, date_str)
+            "SELECT response_ms FROM akeome_records WHERE user_id = ? AND date_str = ? AND is_flying = 0",
+            (user_id, date_str)
         )
         row = cur.fetchone()
-        return row[0] if row else None
+        if not row:
+            return None
+        user_ms = row[0]
+        cur.execute(
+            "SELECT COUNT(*) FROM akeome_records WHERE date_str = ? AND is_flying = 0 AND response_ms <= ?",
+            (date_str, user_ms)
+        )
+        rank_row = cur.fetchone()
+        return rank_row[0] if rank_row else None
 
 def bulk_save_thread_activity(thread_counts: dict):
     with get_db_connection() as conn:
@@ -145,10 +153,14 @@ def fetch_user_stats(uid: int):
         cur.execute("SELECT total_msg_count FROM user_activity WHERE user_id = ?", (uid,))
         row = cur.fetchone()
         count = row[0] if row else 0
-        cur.execute("SELECT COUNT(*) FROM user_activity WHERE total_msg_count > ?", (count,))
-        higher = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM user_activity")
         total = cur.fetchone()[0]
+        if count > 0:
+            cur.execute("SELECT COUNT(*) FROM user_activity WHERE total_msg_count > ?", (count,))
+            higher = cur.fetchone()[0]
+            rank_str = f"{higher + 1}位 / {total}名中"
+        else:
+            rank_str = f"圏外 / {total}名中"
         
         # ポイント情報取得
         cur.execute("SELECT monthly_points, consecutive_days FROM user_points WHERE user_id = ?", (uid,))
@@ -156,10 +168,25 @@ def fetch_user_stats(uid: int):
         pts = p_row[0] if p_row else 0
         consecutive = p_row[1] if p_row else 0
         
-        cur.execute("SELECT COUNT(*) FROM user_points WHERE monthly_points > ?", (pts,))
-        pts_rank = cur.fetchone()[0] + 1
+        if pts > 0:
+            cur.execute("SELECT COUNT(*) FROM user_points WHERE monthly_points > ?", (pts,))
+            pts_rank = cur.fetchone()[0] + 1
+            pts_rank_str = f"{pts_rank}位"
+        else:
+            pts_rank_str = "圏外"
         
-        return count, higher + 1, total, pts, pts_rank, consecutive
+        return count, rank_str, total, pts, pts_rank_str, consecutive
+
+def reset_monthly_points_for_all(current_month_str: str, prev_month_str: str):
+    with get_db_connection() as conn:
+        conn.execute("""
+            INSERT INTO monthly_point_history (user_id, month_str, final_points)
+            SELECT user_id, ?, monthly_points FROM user_points
+            WHERE monthly_points > 0
+            ON CONFLICT(user_id, month_str) DO UPDATE SET final_points = excluded.final_points
+        """, (prev_month_str,))
+        conn.execute("UPDATE user_points SET monthly_points = 0, current_month = ?", (current_month_str,))
+        conn.commit()
 
 def add_scan_target(channel_id: int):
     with get_db_connection() as conn:
@@ -171,14 +198,17 @@ def remove_scan_target(channel_id: int):
         conn.execute("DELETE FROM scan_targets WHERE channel_id = ?", (channel_id,))
         conn.commit()
 
-def toggle_scan_target_notify(channel_id: int) -> int:
+def toggle_scan_target_notify(channel_id: int, explicit_val: int = None) -> int:
     with get_db_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT notify FROM scan_targets WHERE channel_id = ?", (channel_id,))
         row = cur.fetchone()
         if not row:
             return None
-        new_val = 0 if row[0] else 1
+        if explicit_val is not None:
+            new_val = 1 if explicit_val else 0
+        else:
+            new_val = 0 if row[0] else 1
         conn.execute("UPDATE scan_targets SET notify = ? WHERE channel_id = ?", (new_val, channel_id))
         conn.commit()
         return new_val

@@ -31,6 +31,9 @@ def parse_int_list_env(key: str, default=None):
             pass
     return default
 
+ALLOWED_GUILD_ID = parse_int_env("ALLOWED_GUILD_ID", 1370574936963285052)
+TARGET_USER_WARN_ID = parse_int_env("TARGET_USER_WARN_ID", 1439896327071858780)
+
 RANKING_CHANNEL_ID = parse_int_env("RANKING_CHANNEL_ID")
 DEFAULT_RACE_CHANNEL_ID = parse_int_env("DEFAULT_RACE_CHANNEL_ID")
 AKEOME_STAMP_ID = parse_int_env("AKEOME_STAMP_ID")

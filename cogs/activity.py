@@ -5,7 +5,7 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import database
-from config import JST, RANKING_CHANNEL_ID
+from config import JST, RANKING_CHANNEL_ID, ALLOWED_GUILD_ID
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +14,19 @@ async def generate_ranking_embeds(bot: commands.Bot, hide_user: bool = False):
     thread_limit = 34
 
     user_ranks, thread_ranks = await asyncio.to_thread(database.fetch_ranking_data, user_limit, thread_limit)
+    guild = bot.get_guild(ALLOWED_GUILD_ID)
 
     u_text = ""
     if not hide_user:
         for idx, (uid, count) in enumerate(user_ranks, 1):
             user = bot.get_user(uid)
+            if not user and guild:
+                user = guild.get_member(uid)
+            if not user:
+                try:
+                    user = await bot.fetch_user(uid)
+                except Exception:
+                    pass
             name = user.display_name if user else f"同志({uid})"
             u_text += f"➡️ {idx}位 {name} : {count}\n"
             if idx % 10 == 0 and idx != len(user_ranks):
@@ -77,13 +85,14 @@ class ActivityCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot:
+        if message.author.bot or not message.guild or message.guild.id != ALLOWED_GUILD_ID:
             return
         thread_id = message.channel.id if isinstance(message.channel, discord.Thread) else None
         thread_name = message.channel.name if thread_id else None
         await asyncio.to_thread(database.increment_msg_count, message.author.id, thread_id, thread_name)
 
     @app_commands.command(name="activity_ranking", description="現在のチャット労働実績（ランキング）を表示します")
+    @app_commands.guild_only()
     @app_commands.describe(hide_user="Trueにするとユーザーランキングを非表示にし、スレッドのみにします")
     async def activity_ranking(self, interaction: discord.Interaction, hide_user: bool = False):
         await interaction.response.defer()
@@ -92,13 +101,14 @@ class ActivityCog(commands.Cog):
             await interaction.followup.send(embed=emb)
 
     @app_commands.command(name="stats", description="あなたの労働実績（総発言数・獲得ポイント・順位）を表示します")
+    @app_commands.guild_only()
     async def stats(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
-        count, rank, total_users, pts, pts_rank, consecutive = await asyncio.to_thread(database.fetch_user_stats, uid)
+        count, rank_str, total_users, pts, pts_rank_str, consecutive = await asyncio.to_thread(database.fetch_user_stats, uid)
         embed = discord.Embed(title="📋 あなたの労働実績", color=discord.Color.red())
-        embed.add_field(name="総発言数", value=f"{count} 回 ({rank}位 / {total_users}名中)", inline=False)
-        embed.add_field(name="今月のポイント", value=f"{pts} point ({pts_rank}位)", inline=True)
+        embed.add_field(name="総発言数", value=f"{count} 回 ({rank_str})", inline=False)
+        embed.add_field(name="今月のポイント", value=f"{pts} point ({pts_rank_str})", inline=True)
         embed.add_field(name="連続ログイン", value=f"{consecutive} 日", inline=True)
         await interaction.followup.send(embed=embed)
 
