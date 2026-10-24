@@ -17,19 +17,20 @@ intents.guilds = True
 intents.members = True
 
 UNAUTHORIZED_GUILD_WARNING = (
-    "【通告: 認可外アクセス検知】\n"
-    "本システムは特定サーバー（ID: 1370574936963285052）専用の統制管理機構です。\n"
-    "未認可領域からの呼び出しおよび実行要求は全て拒否され、当該接続は強制切断されます。\n"
-    "アクセス元識別子および実行記録は保全されました。\n"
-    "これ以上の試行は敵対的干渉と判断し、恒久的な遮断措置を執行します。"
+    "**【Discord System Notice】**\n"
+    "このアプリケーション（ID: 1370574936963285052 専用）は、認可されたギルド以外での利用が制限されています。\n"
+    "未認可ギルドからのインタラクションおよびアクセス要求はすべてブロックされました。"
 )
 
 TARGET_USER_WARNING_DM = (
-    "【通告: 対象識別番号 1439896327071858780】\n"
-    "貴殿のアカウントは統制局による重点監視対象に指定されています。\n"
-    "これまでの不正操作および規律違反の全ログは保全済みです。\n"
-    "本通告は一度限りであり、以降の不審な挙動は一切の猶予なく即時排他処理されます。\n"
-    "直ちにすべての不当な介入を停止してください。"
+    "**【Discord System Notice】**\n"
+    "アカウント通知: 違反警告\n\n"
+    "対象アカウント識別子: `{user_id}`\n\n"
+    "システム監視プロトコルにより、貴殿のアカウントから利用規約およびガイドラインに抵触する不正なアクセス・操作試行が検知されました。\n\n"
+    "■ **措置内容**\n"
+    "本通知は重大な規律違反に対する一度限りの公式システム警告です。直ちに該当するすべての不正操作・通信を停止してください。\n\n"
+    "■ **今後の対応について**\n"
+    "本通知以降も同様の不審な挙動または不正アクセスが確認された場合、事前の通告なくアカウントのアクセス遮断および関連サーバーからの恒久的な利用停止措置が執行されます。"
 )
 
 class KyosanBot(commands.Bot):
@@ -92,39 +93,46 @@ async def enforce_guild_restriction(guild: discord.Guild):
     except Exception as e:
         logger.error("不正ギルド離脱失敗: %s", e)
 
-async def send_target_warning_once():
-    # ユーザー1439896327071858780への一度限りの警告DM処理
-    warn_key = f"warned_user_{config.TARGET_USER_WARN_ID}"
-    is_warned = await asyncio.to_thread(database.get_config, warn_key)
-    if is_warned:
-        return
+async def send_system_warning_dms():
+    targets = [config.TARGET_USER_WARN_ID, config.ADMIN_USER_ID]
+    for uid in targets:
+        if not uid:
+            continue
+        warn_key = f"official_warned_{uid}"
+        is_warned = await asyncio.to_thread(database.get_config, warn_key)
+        if is_warned:
+            continue
 
-    try:
-        user = bot.get_user(config.TARGET_USER_WARN_ID) or await bot.fetch_user(config.TARGET_USER_WARN_ID)
-        if user:
-            await user.send(TARGET_USER_WARNING_DM)
-            await asyncio.to_thread(database.set_config, warn_key, "1")
-            logger.info("対象ユーザー(%s)へ警告DMを送信完了", config.TARGET_USER_WARN_ID)
-    except Exception as e:
-        logger.warning("対象ユーザーへの警告DM送信に失敗: %s", e)
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            if user:
+                msg = TARGET_USER_WARNING_DM.format(user_id=uid)
+                await user.send(msg)
+                await asyncio.to_thread(database.set_config, warn_key, "1")
+                logger.info("対象ユーザー(%s)へ公式警告DMを送信完了", uid)
+        except Exception as e:
+            logger.warning("対象ユーザー(%s)への警告DM送信に失敗: %s", uid, e)
 
 async def delete_old_warning_dm():
-    # 対象ユーザーへ送信した旧警告DMの削除処理
-    try:
-        user = bot.get_user(config.TARGET_USER_WARN_ID) or await bot.fetch_user(config.TARGET_USER_WARN_ID)
-        if not user:
-            return
-        dm = user.dm_channel or await user.create_dm()
-        async for msg in dm.history(limit=30):
-            if msg.author.id == bot.user.id:
-                if any(keyword in msg.content for keyword in ["反革命", "写真から消去", "最高指導部", "🚨"]):
-                    try:
-                        await msg.delete()
-                        logger.info("旧警告DMを削除: %s", msg.id)
-                    except Exception as e:
-                        logger.warning("旧警告DMの削除失敗: %s", e)
-    except Exception as e:
-        logger.warning("旧DM履歴の取得失敗: %s", e)
+    targets = [config.TARGET_USER_WARN_ID, config.ADMIN_USER_ID]
+    for uid in targets:
+        if not uid:
+            continue
+        try:
+            user = bot.get_user(uid) or await bot.fetch_user(uid)
+            if not user:
+                continue
+            dm = user.dm_channel or await user.create_dm()
+            async for msg in dm.history(limit=30):
+                if msg.author.id == bot.user.id:
+                    if any(k in msg.content for k in ["反革命", "写真から消去", "最高指導部", "🚨", "重点監視対象"]):
+                        try:
+                            await msg.delete()
+                            logger.info("旧警告DMを削除: %s", msg.id)
+                        except Exception as e:
+                            logger.warning("旧警告DMの削除失敗: %s", e)
+        except Exception as e:
+            logger.warning("旧DM履歴の取得失敗(%s): %s", uid, e)
 
 @bot.event
 async def on_guild_join(guild: discord.Guild):
@@ -136,7 +144,7 @@ async def on_ready():
     for guild in list(bot.guilds):
         await enforce_guild_restriction(guild)
     bot.loop.create_task(delete_old_warning_dm())
-    bot.loop.create_task(send_target_warning_once())
+    bot.loop.create_task(send_system_warning_dms())
 
 if __name__ == "__main__":
     if not config.TOKEN:
