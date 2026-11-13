@@ -50,7 +50,7 @@ async def generate_ranking_embeds(bot: commands.Bot, hide_user: bool = False):
         current_chunk = ""
         part = 1
         for line in lines:
-            if len(current_chunk) + len(line) + 1 > 1000:
+            if len(current_chunk) + len(line) + 1 > 1000 and current_chunk:
                 field_name = f"{name_prefix} (その{part})" if part > 1 else name_prefix
                 if len(current_embed) + len(field_name) + len(current_chunk) > 5500:
                     embeds.append(current_embed)
@@ -72,6 +72,8 @@ async def generate_ranking_embeds(bot: commands.Bot, hide_user: bool = False):
         add_long_field(f"優秀労働者 (Top {user_limit})", u_text)
     add_long_field(f"活発なコルホーズ (Top {thread_limit})", t_text)
 
+    if not current_embed.fields:
+        current_embed.description = "データなし"
     embeds.append(current_embed)
     return embeds
 
@@ -86,6 +88,8 @@ class ActivityCog(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild or message.guild.id != ALLOWED_GUILD_ID:
+            return
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
             return
         thread_id = message.channel.id if isinstance(message.channel, discord.Thread) else None
         thread_name = message.channel.name if thread_id else None

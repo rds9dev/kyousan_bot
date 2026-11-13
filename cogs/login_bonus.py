@@ -20,6 +20,8 @@ class LoginBonusCog(commands.Cog):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild or message.guild.id != ALLOWED_GUILD_ID:
             return
+        if message.type not in (discord.MessageType.default, discord.MessageType.reply):
+            return
 
         now_jst = datetime.datetime.now(JST)
         today_date = now_jst.date()

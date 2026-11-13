@@ -1,19 +1,29 @@
+import contextlib
 import sqlite3
 import logging
+import threading
 import time
 import datetime
-from config import DB_PATH, DEFAULT_RACE_CHANNEL_ID
+from config import DB_PATH, DEFAULT_RACE_CHANNEL_ID, JST
 
 logger = logging.getLogger(__name__)
+_points_lock = threading.Lock()
 
+@contextlib.contextmanager
 def get_db_connection():
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     with get_db_connection() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         cursor = conn.cursor()
         cursor.execute("CREATE TABLE IF NOT EXISTS user_activity (user_id INTEGER PRIMARY KEY, total_msg_count INTEGER DEFAULT 0)")
         cursor.execute("CREATE TABLE IF NOT EXISTS thread_activity (thread_id INTEGER PRIMARY KEY, thread_name TEXT, msg_count INTEGER DEFAULT 0)")
@@ -81,7 +91,7 @@ def increment_msg_count(user_id: int, thread_id: int = None, thread_name: str = 
             """, (thread_id, thread_name, thread_name))
         conn.commit()
 
-def save_akeome_record(user_id: int, date_str: str, ms: float, is_flying: int):
+def save_akeome_record(user_id: int, date_str: str, ms: float, is_flying: int) -> bool:
     with get_db_connection() as conn:
         try:
             conn.execute(
@@ -89,8 +99,9 @@ def save_akeome_record(user_id: int, date_str: str, ms: float, is_flying: int):
                 (user_id, date_str, ms, is_flying)
             )
             conn.commit()
+            return True
         except sqlite3.IntegrityError:
-            pass
+            return False
 
 def get_akeome_today_rank(user_id: int, date_str: str):
     with get_db_connection() as conn:
@@ -104,13 +115,15 @@ def get_akeome_today_rank(user_id: int, date_str: str):
             return None
         user_ms = row[0]
         cur.execute(
-            "SELECT COUNT(*) FROM akeome_records WHERE date_str = ? AND is_flying = 0 AND response_ms <= ?",
+            "SELECT COUNT(*) FROM akeome_records WHERE date_str = ? AND is_flying = 0 AND response_ms < ?",
             (date_str, user_ms)
         )
         rank_row = cur.fetchone()
-        return rank_row[0] if rank_row else None
+        return (rank_row[0] + 1) if rank_row else None
 
 def bulk_save_thread_activity(thread_counts: dict):
+    if not thread_counts:
+        return
     with get_db_connection() as conn:
         conn.execute("DELETE FROM thread_activity")
         for tid, data in thread_counts.items():
@@ -163,13 +176,14 @@ def fetch_user_stats(uid: int):
             rank_str = f"圏外 / {total}名中"
         
         # ポイント情報取得
-        cur.execute("SELECT monthly_points, consecutive_days FROM user_points WHERE user_id = ?", (uid,))
+        current_month_str = datetime.datetime.now(JST).strftime("%Y-%m")
+        cur.execute("SELECT monthly_points, consecutive_days, current_month FROM user_points WHERE user_id = ?", (uid,))
         p_row = cur.fetchone()
-        pts = p_row[0] if p_row else 0
+        pts = p_row[0] if (p_row and p_row[2] == current_month_str) else 0
         consecutive = p_row[1] if p_row else 0
         
         if pts > 0:
-            cur.execute("SELECT COUNT(*) FROM user_points WHERE monthly_points > ?", (pts,))
+            cur.execute("SELECT COUNT(*) FROM user_points WHERE current_month = ? AND monthly_points > ?", (current_month_str, pts))
             pts_rank = cur.fetchone()[0] + 1
             pts_rank_str = f"{pts_rank}位"
         else:
@@ -178,15 +192,17 @@ def fetch_user_stats(uid: int):
         return count, rank_str, total, pts, pts_rank_str, consecutive
 
 def reset_monthly_points_for_all(current_month_str: str, prev_month_str: str):
-    with get_db_connection() as conn:
-        conn.execute("""
-            INSERT INTO monthly_point_history (user_id, month_str, final_points)
-            SELECT user_id, ?, monthly_points FROM user_points
-            WHERE monthly_points > 0
-            ON CONFLICT(user_id, month_str) DO UPDATE SET final_points = excluded.final_points
-        """, (prev_month_str,))
-        conn.execute("UPDATE user_points SET monthly_points = 0, current_month = ?", (current_month_str,))
-        conn.commit()
+    with _points_lock:
+        with get_db_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""
+                INSERT INTO monthly_point_history (user_id, month_str, final_points)
+                SELECT user_id, ?, monthly_points FROM user_points
+                WHERE monthly_points > 0 AND current_month = ?
+                ON CONFLICT(user_id, month_str) DO UPDATE SET final_points = excluded.final_points
+            """, (prev_month_str, prev_month_str))
+            conn.execute("UPDATE user_points SET monthly_points = 0, current_month = ?", (current_month_str,))
+            conn.commit()
 
 def add_scan_target(channel_id: int):
     with get_db_connection() as conn:
@@ -222,61 +238,63 @@ def process_user_login_and_points(user_id: int, msg_content: str, today_date, cu
     today_str = today_date.strftime("%Y-%m-%d")
     yesterday_str = (today_date - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
 
-    with get_db_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT monthly_points, consecutive_days, last_login_date, last_msg_content, current_month FROM user_points WHERE user_id = ?",
-            (user_id,)
-        )
-        row = cur.fetchone()
+    with _points_lock:
+        with get_db_connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT monthly_points, consecutive_days, last_login_date, last_msg_content, current_month FROM user_points WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cur.fetchone()
 
-        if not row:
-            monthly_points = 0
-            consecutive_days = 0
-            last_login_date = None
-            last_msg_content = None
-            db_month = current_month_str
-        else:
-            monthly_points, consecutive_days, last_login_date, last_msg_content, db_month = row
-
-        if db_month != current_month_str:
-            if db_month and monthly_points > 0:
-                conn.execute(
-                    "INSERT INTO monthly_point_history (user_id, month_str, final_points) VALUES (?, ?, ?) ON CONFLICT(user_id, month_str) DO UPDATE SET final_points = excluded.final_points",
-                    (user_id, db_month, monthly_points)
-                )
-            monthly_points = 0
-            db_month = current_month_str
-
-        is_first_login = False
-        # 初日ログイン判定
-        if last_login_date != today_str:
-            is_first_login = True
-            if last_login_date == yesterday_str:
-                consecutive_days += 1
+            if not row:
+                monthly_points = 0
+                consecutive_days = 0
+                last_login_date = None
+                last_msg_content = None
+                db_month = current_month_str
             else:
-                consecutive_days = 1
-            
-            # ログインボーナス (基本 10pt + 連続日数 * 2pt)
-            login_bonus = 10 + (consecutive_days * 2)
-            monthly_points += login_bonus
-            last_login_date = today_str
+                monthly_points, consecutive_days, last_login_date, last_msg_content, db_month = row
 
-        clean_content = msg_content.strip()
-        if last_msg_content is None or clean_content != last_msg_content:
-            monthly_points += 1
-            last_msg_content = clean_content
+            if db_month != current_month_str:
+                if db_month and monthly_points > 0:
+                    conn.execute(
+                        "INSERT INTO monthly_point_history (user_id, month_str, final_points) VALUES (?, ?, ?) ON CONFLICT(user_id, month_str) DO UPDATE SET final_points = excluded.final_points",
+                        (user_id, db_month, monthly_points)
+                    )
+                monthly_points = 0
+                db_month = current_month_str
 
-        conn.execute("""
-            INSERT INTO user_points (user_id, monthly_points, consecutive_days, last_login_date, last_msg_content, current_month)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                monthly_points = excluded.monthly_points,
-                consecutive_days = excluded.consecutive_days,
-                last_login_date = excluded.last_login_date,
-                last_msg_content = excluded.last_msg_content,
-                current_month = excluded.current_month
-        """, (user_id, monthly_points, consecutive_days, last_login_date, last_msg_content, db_month))
-        conn.commit()
+            is_first_login = False
+            # 初日ログイン判定
+            if last_login_date != today_str:
+                is_first_login = True
+                if last_login_date == yesterday_str:
+                    consecutive_days += 1
+                else:
+                    consecutive_days = 1
+                
+                # ログインボーナス (基本 10pt + 連続日数 * 2pt)
+                login_bonus = 10 + (consecutive_days * 2)
+                monthly_points += login_bonus
+                last_login_date = today_str
 
-        return is_first_login, consecutive_days, monthly_points
+            clean_content = msg_content.strip()
+            if last_msg_content is None or clean_content != last_msg_content:
+                monthly_points += 1
+                last_msg_content = clean_content
+
+            conn.execute("""
+                INSERT INTO user_points (user_id, monthly_points, consecutive_days, last_login_date, last_msg_content, current_month)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    monthly_points = excluded.monthly_points,
+                    consecutive_days = excluded.consecutive_days,
+                    last_login_date = excluded.last_login_date,
+                    last_msg_content = excluded.last_msg_content,
+                    current_month = excluded.current_month
+            """, (user_id, monthly_points, consecutive_days, last_login_date, last_msg_content, db_month))
+            conn.commit()
+
+            return is_first_login, consecutive_days, monthly_points

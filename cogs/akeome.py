@@ -17,8 +17,19 @@ class AkeomeCog(commands.Cog):
     def cog_unload(self):
         self.announce_daily_akeome.cancel()
 
+    async def _resolve_display_name(self, uid: int) -> str:
+        user = self.bot.get_user(uid)
+        if not user:
+            try:
+                user = await self.bot.fetch_user(uid)
+            except Exception:
+                return f"同志({uid})"
+        return user.display_name if user else f"同志({uid})"
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if self.bot.user and payload.user_id == self.bot.user.id:
+            return
         if payload.member and payload.member.bot:
             return
 
@@ -51,9 +62,16 @@ class AkeomeCog(commands.Cog):
         if now_jst.hour == 0 and 0.0 <= sec_diff <= 60.0:
             date_str = today_00.strftime("%Y-%m-%d")
             ms = sec_diff * 1000
-            await asyncio.to_thread(database.save_akeome_record, payload.user_id, date_str, ms, 0)
-            
+            is_saved = await asyncio.to_thread(database.save_akeome_record, payload.user_id, date_str, ms, 0)
+            if not is_saved:
+                return
+
             channel = self.bot.get_channel(payload.channel_id)
+            if not channel:
+                try:
+                    channel = await self.bot.fetch_channel(payload.channel_id)
+                except discord.HTTPException:
+                    return
             if channel:
                 try:
                     msg = await channel.fetch_message(payload.message_id)
@@ -116,17 +134,35 @@ class AkeomeCog(commands.Cog):
 
         s_lines = []
         for idx, (uid, ms) in enumerate(success_records, 1):
-            u = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
-            s_lines.append(f"{idx}位: {u.display_name} ( +{ms:.3f} ms )\n")
+            name = await self._resolve_display_name(uid)
+            s_lines.append(f"{idx}位: {name} ( +{ms:.3f} ms )\n")
 
         f_lines = []
         for uid, ms in flying_records:
-            u = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
-            f_lines.append(f"{u.display_name} ( {ms:.3f} ms )\n")
+            name = await self._resolve_display_name(uid)
+            f_lines.append(f"{name} ( {ms:.3f} ms )\n")
 
-        embed.add_field(name="成功者 (最速順)", value="".join(s_lines) or "データなし", inline=False)
-        if f_lines:
-            embed.add_field(name="フライング (シベリア行き)", value="".join(f_lines), inline=False)
+        def add_chunked_field(name_prefix: str, lines: list[str], empty_text: str = None):
+            if not lines:
+                if empty_text:
+                    embed.add_field(name=name_prefix, value=empty_text, inline=False)
+                return
+            chunk = ""
+            part = 1
+            for line in lines:
+                if len(chunk) + len(line) > 1000 and chunk:
+                    field_name = f"{name_prefix} (その{part})" if part > 1 else name_prefix
+                    embed.add_field(name=field_name, value=chunk, inline=False)
+                    chunk = line
+                    part += 1
+                else:
+                    chunk += line
+            if chunk:
+                field_name = f"{name_prefix} (その{part})" if part > 1 else name_prefix
+                embed.add_field(name=field_name, value=chunk, inline=False)
+
+        add_chunked_field("成功者 (最速順)", s_lines, empty_text="データなし")
+        add_chunked_field("フライング (シベリア行き)", f_lines)
         await channel.send(embed=embed)
 
     @announce_daily_akeome.before_loop

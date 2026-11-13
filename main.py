@@ -42,6 +42,7 @@ class KyosanBot(commands.Bot):
             chunk_guilds_at_startup=False,
             max_messages=5
         )
+        self._startup_tasks_done = False
 
     async def setup_hook(self):
         async def global_interaction_check(interaction: discord.Interaction) -> bool:
@@ -143,8 +144,10 @@ async def on_ready():
     logger.info("システム稼働。共産趣味ボット統制下オンライン。(%s)", bot.user)
     for guild in list(bot.guilds):
         await enforce_guild_restriction(guild)
-    bot.loop.create_task(delete_old_warning_dm())
-    bot.loop.create_task(send_system_warning_dms())
+    if not bot._startup_tasks_done:
+        bot._startup_tasks_done = True
+        bot.loop.create_task(delete_old_warning_dm())
+        bot.loop.create_task(send_system_warning_dms())
 
 if __name__ == "__main__":
     if not config.TOKEN:

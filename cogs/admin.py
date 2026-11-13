@@ -22,6 +22,7 @@ def is_authorized_for_censor(interaction: discord.Interaction) -> bool:
 class AdminCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._scan_lock = asyncio.Lock()
         self.automated_thread_sync.start()
 
     def cog_unload(self):
@@ -32,13 +33,17 @@ class AdminCog(commands.Cog):
 
         threads_dict = {t.id: t for t in target_channel.threads}
         try:
-            for t in await target_channel.active_threads():
-                threads_dict[t.id] = t
+            for t in await target_channel.guild.active_threads():
+                if t.parent_id == target_channel.id:
+                    threads_dict[t.id] = t
         except Exception as e:
             logger.debug("active_threads取得スキップ: %s", e)
 
-        async for thread in target_channel.archived_threads(limit=None):
-            threads_dict[thread.id] = thread
+        try:
+            async for thread in target_channel.archived_threads(limit=None):
+                threads_dict[thread.id] = thread
+        except Exception as e:
+            logger.warning("チャンネル %s のアーカイブスレッド取得失敗: %s", target_channel.id, e)
         threads = list(threads_dict.values())
 
         total = len(threads)
@@ -75,39 +80,58 @@ class AdminCog(commands.Cog):
         return thread_counts
 
     async def run_all_scans(self, notify_channel: discord.TextChannel = None):
-        targets = await asyncio.to_thread(database.get_scan_targets)
-        if not targets:
+        if self._scan_lock.locked():
             if notify_channel:
                 try:
-                    await notify_channel.send("⚠️ 走査対象チャンネルが未登録です。`/setting add_target` で登録してください。")
+                    await notify_channel.send("⏳ 別の走査タスクが実行中です。完了までお待ちください。")
                 except discord.HTTPException:
                     pass
             return
 
-        all_threads = {}
-        for channel_id, notify in targets:
-            channel = self.bot.get_channel(channel_id)
-            if not channel:
-                continue
-            target_notify = notify_channel if (notify or notify_channel) else None
-            counts = await self.perform_thread_sync(channel, target_notify)
-            all_threads.update(counts)
+        async with self._scan_lock:
+            targets = await asyncio.to_thread(database.get_scan_targets)
+            if not targets:
+                if notify_channel:
+                    try:
+                        await notify_channel.send("⚠️ 走査対象チャンネルが未登録です。`/setting add_target` で登録してください。")
+                    except discord.HTTPException:
+                        pass
+                return
 
-        await asyncio.to_thread(database.bulk_save_thread_activity, all_threads)
-        if notify_channel:
-            try:
-                await notify_channel.send(f"🎖️ **国家計画経済達成: 全走査対象 ({len(targets)}チャンネル, 計{len(all_threads)}スレッド) の再構築完了。**")
-            except discord.HTTPException:
-                pass
+            all_threads = {}
+            scanned_channels = 0
+            for channel_id, notify in targets:
+                channel = self.bot.get_channel(channel_id)
+                if not channel or not isinstance(channel, (discord.TextChannel, discord.ForumChannel)):
+                    continue
+                scanned_channels += 1
+                target_notify = notify_channel if (notify or notify_channel) else None
+                counts = await self.perform_thread_sync(channel, target_notify)
+                all_threads.update(counts)
+
+            if scanned_channels > 0 and all_threads:
+                await asyncio.to_thread(database.bulk_save_thread_activity, all_threads)
+            if notify_channel:
+                try:
+                    await notify_channel.send(f"🎖️ **国家計画経済達成: 全走査対象 ({scanned_channels}/{len(targets)}チャンネル, 計{len(all_threads)}スレッド) の再構築完了。**")
+                except discord.HTTPException:
+                    pass
 
     @app_commands.command(name="censor", description="【管理者/権限ロール専用】指定ユーザーのメッセージを粛清する")
     @app_commands.guild_only()
     async def censor(self, interaction: discord.Interaction, target: discord.Member, limit: int = 50):
         if not is_authorized_for_censor(interaction):
             return await interaction.response.send_message("❌ 権限がありません。KGBに通報しました。", ephemeral=True)
+        if not (1 <= limit <= 500):
+            return await interaction.response.send_message("❌ 削除件数は 1〜500 の間で指定してください。", ephemeral=True)
+        if not hasattr(interaction.channel, "purge"):
+            return await interaction.response.send_message("❌ このチャンネルではメッセージを削除できません。", ephemeral=True)
         await interaction.response.defer(ephemeral=True)
-        deleted = await interaction.channel.purge(limit=limit, check=lambda m: m.author.id == target.id)
-        await interaction.followup.send(f"粛清完了: {target.display_name} の痕跡を {len(deleted)} 件消し去った。")
+        try:
+            deleted = await interaction.channel.purge(limit=limit, check=lambda m: m.author.id == target.id)
+            await interaction.followup.send(f"粛清完了: {target.display_name} の痕跡を {len(deleted)} 件消し去った。")
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"❌ メッセージの削除に失敗しました: {e}")
 
     @app_commands.command(name="setting", description="【管理者/権限ロール専用】走査設定を管理します")
     @app_commands.guild_only()
@@ -159,23 +183,24 @@ class AdminCog(commands.Cog):
 
         elif act == "list_targets":
             targets = await asyncio.to_thread(database.get_scan_targets)
-            if not targets:
-                return await interaction.followup.send("📭 走査対象チャンネルは未登録です。")
             lines = []
             for cid, notify_flag in targets:
                 ch = self.bot.get_channel(cid)
                 name = ch.mention if ch else f"#{cid}"
                 lines.append(f"{name} (通知: {'有効' if notify_flag else '無効'})")
+            targets_text = "\n".join(lines) if lines else "📭 走査対象チャンネルは未登録です。"
             race_id = await asyncio.to_thread(database.get_race_channel_id)
-            race_ch = self.bot.get_channel(race_id)
-            race_name = race_ch.mention if race_ch else f"#{race_id}"
+            race_ch = self.bot.get_channel(race_id) if race_id else None
+            race_name = race_ch.mention if race_ch else (f"#{race_id}" if race_id else "未設定")
             await interaction.followup.send(
-                f"📋 **走査対象チャンネル**\n" + "\n".join(lines) + f"\n\n🎯 **あけおめ受付チャンネル**: {race_name}"
+                f"📋 **走査対象チャンネル**\n{targets_text}\n\n🎯 **あけおめ受付チャンネル**: {race_name}"
             )
 
         elif act == "set_race_channel":
             if not channel:
                 return await interaction.followup.send("❌ チャンネルを指定してください。")
+            if not isinstance(channel, discord.TextChannel):
+                return await interaction.followup.send("❌ あけおめ受付チャンネルにはテキストチャンネルを指定してください。")
             await asyncio.to_thread(database.set_config, "race_channel", channel.id)
             await interaction.followup.send(f"🎯 あけおめ受付チャンネルを {channel.mention} に設定しました。")
 
