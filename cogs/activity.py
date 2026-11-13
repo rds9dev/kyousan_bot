@@ -110,7 +110,7 @@ class ActivityCog(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         uid = interaction.user.id
         count, rank_str, total_users, pts, pts_rank_str, consecutive = await asyncio.to_thread(database.fetch_user_stats, uid)
-        embed = discord.Embed(title="📋 あなたの労働実績", color=discord.Color.red())
+        embed = discord.Embed(title="あなたの労働実績", color=discord.Color.red())
         embed.add_field(name="総発言数", value=f"{count} 回 ({rank_str})", inline=False)
         embed.add_field(name="今月のポイント", value=f"{pts} point ({pts_rank_str})", inline=True)
         embed.add_field(name="連続ログイン", value=f"{consecutive} 日", inline=True)

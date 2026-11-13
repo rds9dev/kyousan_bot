@@ -31,8 +31,6 @@ def init_db():
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_akeome_perf ON akeome_records (date_str, is_flying, response_ms);")
         cursor.execute("CREATE TABLE IF NOT EXISTS scan_targets (channel_id INTEGER PRIMARY KEY, notify INTEGER DEFAULT 1)")
         cursor.execute("CREATE TABLE IF NOT EXISTS bot_config (key TEXT PRIMARY KEY, value TEXT)")
-        
-        # ポイント＆ログイン機能テーブル
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_points (
                 user_id INTEGER PRIMARY KEY,
@@ -175,7 +173,6 @@ def fetch_user_stats(uid: int):
         else:
             rank_str = f"圏外 / {total}名中"
         
-        # ポイント情報取得
         current_month_str = datetime.datetime.now(JST).strftime("%Y-%m")
         cur.execute("SELECT monthly_points, consecutive_days, current_month FROM user_points WHERE user_id = ?", (uid,))
         p_row = cur.fetchone()
@@ -267,15 +264,13 @@ def process_user_login_and_points(user_id: int, msg_content: str, today_date, cu
                 db_month = current_month_str
 
             is_first_login = False
-            # 初日ログイン判定
             if last_login_date != today_str:
                 is_first_login = True
                 if last_login_date == yesterday_str:
                     consecutive_days += 1
                 else:
                     consecutive_days = 1
-                
-                # ログインボーナス (基本 10pt + 連続日数 * 2pt)
+
                 login_bonus = 10 + (consecutive_days * 2)
                 monthly_points += login_bonus
                 last_login_date = today_str
